@@ -42,8 +42,8 @@ EXPOSE 80
 # 设置时区
 ENV TZ=Asia/Shanghai
 
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:80/ || exit 1
+# 健康检查（固定 IPv4，避免容器内 localhost 解析到 ::1 而 nginx 未监听 IPv6）
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD wget --no-verbose --tries=1 --spider http://127.0.0.1:80/frontend-health || exit 1
 
 CMD ["nginx", "-g", "daemon off;"]

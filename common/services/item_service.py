@@ -1,4 +1,4 @@
-﻿"""
+"""
 商品服务
 
 功能：
@@ -108,6 +108,14 @@ class ItemService:
         latest = (latest_cookie or "").strip()
         if not latest or latest == (account.cookie or ""):
             return
+        from common.utils.cookie_refresh import cookie_identity_matches
+
+        if not cookie_identity_matches(account, latest):
+            logger.error(
+                f"账号[{account.account_id}]检测接口返回了其他账号的Cookie，"
+                "已拒绝回填，避免账号串号"
+            )
+            return
         account.cookie = latest
         logger.info(f"账号[{account.account_id}]检测期间令牌已刷新，后续商品抓取改用新Cookie")
 
@@ -167,6 +175,77 @@ class ItemService:
             同时属于该账号且存在于本地商品库的商品 ID 集合。
         """
         return set((await self._get_existing_item_map(account, item_ids)).keys())
+
+    async def _validate_seller_items_belong_to_account(
+        self,
+        account: XYAccount,
+        items: list[dict],
+    ) -> tuple[bool, str, str | None]:
+        """校验鱼小铺商品列表确实属于当前登录账号，防止子账号/Cookie 串号导致商品串号。
+
+        卖家平台商品列表接口只返回商品，不返回卖家 ID；这里取本页第一个商品调用详情接口，
+        用 ``sellerDO.sellerId`` 与当前 Cookie 的 ``unb`` 对比。两者不一致时由调用方改用
+        个人版接口按当前账号重新获取；个人版仍无法确认归属时才拒绝入库，避免把 A 账号的
+        商品写到 B 账号名下。
+
+        Args:
+            account: 当前要同步的账号。
+            items: 本页抓取到的商品（个人版商品没有 source=seller，不做校验）。
+        Returns:
+            (是否允许入库, 失败原因, 商品实际卖家 ID)
+        """
+        seller_item = next(
+            (
+                item
+                for item in items
+                if item.get("source") == "seller" and str(item.get("id") or "").strip()
+            ),
+            None,
+        )
+        if seller_item is None:
+            return True, "", None
+
+        expected_user_id = str(account.unb or "").strip() or self._resolve_account_fetch_user_id(account)
+        item_id = str(seller_item.get("id") or "").strip()
+
+        from common.services.xianyu_detail_client import XianyuItemDetailClient
+
+        try:
+            detail = await XianyuItemDetailClient(
+                account.account_id,
+                account.cookie,
+                owner_id=account.owner_id,
+            ).get_detail(item_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"账号[{account.account_id}]商品归属校验异常（商品 {item_id}）: {exc}"
+            )
+            return False, f"无法校验商品归属，已停止本次同步: {exc}", None
+
+        actual_seller_id = str(detail.get("seller_user_id") or "").strip()
+        if not detail.get("success") or not actual_seller_id:
+            error = detail.get("error") or "商品详情未返回卖家ID"
+            logger.warning(
+                f"账号[{account.account_id}]商品归属校验失败（商品 {item_id}）: {error}"
+            )
+            return False, f"无法校验商品归属，已停止本次同步: {error}", None
+
+        if actual_seller_id != expected_user_id:
+            logger.error(
+                f"账号[{account.account_id}]商品归属不一致: Cookie用户[{expected_user_id}] "
+                f"商品实际卖家[{actual_seller_id}]，已阻止入库以避免串号"
+            )
+            return (
+                False,
+                (
+                    f"账号[{account.account_id}]的登录态与商品实际卖家[{actual_seller_id}]不一致，"
+                    "可能是鱼小铺子账号或Cookie串号。为避免商品串号，本次没有保存任何商品；"
+                    "请重新登录该账号，或改用商品实际归属的主账号获取。"
+                ),
+                actual_seller_id,
+            )
+
+        return True, "", actual_seller_id
 
     async def list_items(self, owner_id: int | None, account_id: str | None = None) -> list[dict]:
         """获取商品列表
@@ -326,6 +405,36 @@ class ItemService:
         items = result.get("items") or []
         count = result.get("current_count") or len(items)
 
+        if items:
+            owner_ok, owner_message, _ = await self._validate_seller_items_belong_to_account(
+                account, items
+            )
+            if not owner_ok:
+                logger.warning(
+                    f"账号[{account.account_id}]鱼小铺列表返回其他卖家的商品，"
+                    "改用个人版接口按当前账号重新获取，避免商品串号"
+                )
+                from common.utils.item_info_manager import ItemInfoManager
+
+                fallback_manager = ItemInfoManager(account.account_id, account.cookie)
+                try:
+                    result = await fallback_manager.get_item_list_info(
+                        page, page_size, myid=myid
+                    )
+                except Exception as exc:
+                    return {"success": False, "message": f"获取商品失败: {exc}"}
+                finally:
+                    await fallback_manager.close()
+
+                if not result or not result.get("success"):
+                    message = ""
+                    if isinstance(result, dict):
+                        message = result.get("message") or result.get("error") or ""
+                    return {"success": False, "message": message or "获取商品失败"}
+
+                items = result.get("items") or []
+                count = result.get("current_count") or len(items)
+
         try:
             saved_count, _ = await self.save_fetched_items(account, items)
         except Exception as exc:
@@ -436,6 +545,7 @@ class ItemService:
         total_saved_count = 0
         fetched_pages = 0
         matched_required_title_keyword = False
+        fallback_to_personal = False
         try:
             page_number = 1
             while True:
@@ -457,6 +567,30 @@ class ItemService:
                 if not items:
                     logger.info(f"账号[{account.account_id}]商品同步第 {page_number} 页无数据，结束获取")
                     break
+
+                if page_number == 1:
+                    owner_ok, owner_message, actual_seller_id = (
+                        await self._validate_seller_items_belong_to_account(account, items)
+                    )
+                    if not owner_ok:
+                        if not fallback_to_personal:
+                            logger.warning(
+                                f"账号[{account.account_id}]鱼小铺列表返回其他卖家[{actual_seller_id}]的商品，"
+                                "改用个人版接口按当前账号重新获取，避免商品串号"
+                            )
+                            await manager.close()
+                            from common.utils.item_info_manager import ItemInfoManager
+
+                            manager = ItemInfoManager(account.account_id, account.cookie)
+                            fallback_to_personal = True
+                            page_number = 1
+                            continue
+                        return {
+                            "success": False,
+                            "message": owner_message,
+                            "account_mismatch": True,
+                            "seller_user_id": actual_seller_id,
+                        }
 
                 valid_items, skipped_count = self._collect_valid_item_entries(items)
                 unique_item_ids = list(dict.fromkeys(item_id for item_id, _ in valid_items))
@@ -1121,19 +1255,29 @@ class ItemService:
             select(XYAccount.id).where(XYAccount.id.in_(account_pks))
         )
         existing_pks = {row[0] for row in existing_rows.all()}
-        if existing_pks:
+
+        # 同一个 item_id 可能同时存在「孤儿记录」和「正常账号记录」：
+        # 例如账号删除后，商品 ID 又被另一个账号重新获取。此时只删除孤儿记录，
+        # 保留正常账号下的商品；否则会误判 account_required，导致界面永远删不掉。
+        orphan_items = [it for it in items if it.account_pk not in existing_pks]
+        if not orphan_items:
             # 商品所属账号仍存在 → 不允许脱离账号删除，要求指定账号
             return "account_required"
 
-        # 全部为孤儿商品（账号已删除）→ 按 item_id 删除，并清理卡券关联
-        matcher = CardMatcher(self.session)
-        rel_count = await matcher.delete_relations_by_item_id(item_id)
-        if rel_count > 0:
-            logger.info(f"删除孤儿商品 {item_id} 的 {rel_count} 条卡券关联记录")
-        for it in items:
+        # 只有全部都是孤儿记录时才清理卡券关联；混有正常记录时不能动关联表，
+        # 否则会连带删除正常账号商品的卡券绑定。
+        if len(orphan_items) == len(items):
+            matcher = CardMatcher(self.session)
+            rel_count = await matcher.delete_relations_by_item_id(item_id)
+            if rel_count > 0:
+                logger.info(f"删除孤儿商品 {item_id} 的 {rel_count} 条卡券关联记录")
+
+        for it in orphan_items:
             await self.session.delete(it)
         await self.session.commit()
-        logger.info(f"已删除孤儿商品 {item_id}（所属账号已不存在），共 {len(items)} 条记录")
+        logger.info(
+            f"已删除孤儿商品 {item_id}（所属账号已不存在），共 {len(orphan_items)} 条记录"
+        )
         return "ok"
 
     async def delete_many(self, account: XYAccount, item_ids: list[str]) -> int:

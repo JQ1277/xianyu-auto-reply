@@ -270,6 +270,33 @@ async def get_account_by_identity(
         return await _query(db_session)
 
 
+def cookie_identity_matches(account: XYAccount, new_cookies_str: str) -> bool:
+    """判断新 Cookie 是否仍属于同一闲鱼账号，防止把 A 账号 Cookie 写到 B 账号。
+
+    卖家平台接口在子账号/共享浏览器会话下可能返回另一个账号的 Set-Cookie；
+    若直接把响应 Cookie 回写，会把账号记录彻底串成另一个账号。这里以库内 ``unb``
+    或旧 Cookie 的 ``unb`` 作为稳定身份，新 Cookie 的 ``unb`` 不一致时拒绝写入。
+
+    Args:
+        account: 数据库中的账号记录。
+        new_cookies_str: 准备写回的新 Cookie 字符串。
+    Returns:
+        True 表示身份一致或无法判断；False 表示检测到账号身份变化。
+    """
+    old_unb = str(account.unb or "").strip()
+    if not old_unb:
+        old_unb = str(parse_cookie_string(account.cookie or "").get("unb") or "").strip()
+    new_unb = str(parse_cookie_string(new_cookies_str or "").get("unb") or "").strip()
+
+    if old_unb and new_unb != old_unb:
+        logger.error(
+            f"【{account.account_id}】拒绝写入其他账号的Cookie: "
+            f"库内用户[{old_unb}] 新Cookie用户[{new_unb or '-'}]"
+        )
+        return False
+    return True
+
+
 async def update_account_cookies_in_db(
     account_id: str,
     new_cookies_str: str,
@@ -293,6 +320,8 @@ async def update_account_cookies_in_db(
             if not account:
                 logger.warning(f"【{account_id}】数据库中未找到账号，无法更新Cookie")
                 return False
+            if not cookie_identity_matches(account, new_cookies_str):
+                return False
             account.cookie = new_cookies_str
             account.metadata_json = clear_cookie_refresh_snapshot(account.metadata_json)
             session.add(account)
@@ -303,6 +332,8 @@ async def update_account_cookies_in_db(
                 account = await get_account_by_identity(account_id, owner_id=owner_id, session=db_session)
                 if not account:
                     logger.warning(f"【{account_id}】数据库中未找到账号，无法更新Cookie")
+                    return False
+                if not cookie_identity_matches(account, new_cookies_str):
                     return False
                 account.cookie = new_cookies_str
                 account.metadata_json = clear_cookie_refresh_snapshot(account.metadata_json)
