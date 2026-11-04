@@ -23,14 +23,14 @@ services:
       --appendonly yes
 
   backend-web:
-    image: xianyu-build/backend-web:20261103
+    image: xianyu-build/backend-web:20261104
     logging: *default-logging
     mem_limit: 640m
     ports: !override
       - "127.0.0.1:${BACKEND_WEB_PORT:-8089}:8089"
 
   websocket:
-    image: xianyu-build/websocket:20261103
+    image: xianyu-build/websocket:20261104
     logging: *default-logging
     mem_limit: 1024m
     shm_size: 256m
@@ -38,7 +38,7 @@ services:
       - "127.0.0.1:${WEBSOCKET_PORT:-8090}:8090"
 
   scheduler:
-    image: xianyu-build/scheduler:20261103
+    image: xianyu-build/scheduler:20261104
     logging: *default-logging
     mem_limit: 512m
     shm_size: 128m
@@ -46,7 +46,7 @@ services:
       - "127.0.0.1:${SCHEDULER_PORT:-8091}:8091"
 
   frontend:
-    image: xianyu-build/frontend:20261103
+    image: xianyu-build/frontend:20261104
     logging: *default-logging
     mem_limit: 96m
     ports: !override
