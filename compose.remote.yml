@@ -1,0 +1,54 @@
+# 远程 nec8 专用覆盖：限制内存、只暴露前端 9000，后端端口仅本机可访问。
+# 用法：docker compose -f docker-compose.deploy.yml -f compose.remote.yml --env-file .env up -d
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  mysql:
+    logging: *default-logging
+    mem_limit: 768m
+
+  redis:
+    logging: *default-logging
+    mem_limit: 192m
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-xianyu@2026}
+      --maxmemory 128mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+
+  backend-web:
+    image: xianyu-build/backend-web:20261103
+    logging: *default-logging
+    mem_limit: 640m
+    ports: !override
+      - "127.0.0.1:${BACKEND_WEB_PORT:-8089}:8089"
+
+  websocket:
+    image: xianyu-build/websocket:20261103
+    logging: *default-logging
+    mem_limit: 1024m
+    shm_size: 256m
+    ports: !override
+      - "127.0.0.1:${WEBSOCKET_PORT:-8090}:8090"
+
+  scheduler:
+    image: xianyu-build/scheduler:20261103
+    logging: *default-logging
+    mem_limit: 512m
+    shm_size: 128m
+    ports: !override
+      - "127.0.0.1:${SCHEDULER_PORT:-8091}:8091"
+
+  frontend:
+    image: xianyu-build/frontend:20261103
+    logging: *default-logging
+    mem_limit: 96m
+    ports: !override
+      - "0.0.0.0:${FRONTEND_PORT:-9000}:80"
+
